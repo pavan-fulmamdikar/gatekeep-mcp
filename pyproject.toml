@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gatekeep-mcp"
-version = "0.2.0"
+version = "0.2.1"
 description = "Zero-dependency sub-millisecond firewall and automatic Saga undo proxy for MCP AI agents"
 readme = "README.md"
 license = {text = "MIT OR Apache-2.0"}

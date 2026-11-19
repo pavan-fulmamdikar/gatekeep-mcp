@@ -52,30 +52,39 @@ _B64_TOKEN_RE = re.compile(
 )
 
 
+_REDACTED_TOKEN_RE = re.compile(r"\[REDACTED(?::[^\]]+)?\]")
+
+
 def _normalize_for_inspection(text: str) -> str:
     """Strip zero-width/bidi obfuscation characters and fold Unicode lookalikes via NFKC."""
     stripped = _INVISIBLE_CHARS_RE.sub("", text)
     return unicodedata.normalize("NFKC", stripped)
 
 
+def _strip_redacted_placeholders(text: str) -> str:
+    """Remove literal `[REDACTED]` / `[REDACTED:...]` tokens without skipping remaining text."""
+    return _REDACTED_TOKEN_RE.sub("", text)
+
+
 def _scan_plaintext_secret_patterns(text: str, *, check_luhn: bool = True) -> Optional[str]:
-    if not text or "[REDACTED" in text:
+    cleaned = _strip_redacted_placeholders(text) if text else ""
+    if not cleaned:
         return None
-    if _PEM_PRIVATE_KEY_RE.search(text):
+    if _PEM_PRIVATE_KEY_RE.search(cleaned):
         return "private_key"
-    if _DB_URI_SECRET_RE.search(text):
+    if _DB_URI_SECRET_RE.search(cleaned):
         return "credentialed_db_uri"
-    if _BEARER_RE.search(text):
+    if _BEARER_RE.search(cleaned):
         return "bearer_token"
-    if _API_TOKEN_RE.search(text):
+    if _API_TOKEN_RE.search(cleaned):
         return "api_token"
-    if _SSN_RE.search(text):
+    if _SSN_RE.search(cleaned):
         return "ssn"
-    env_match = _ENV_ASSIGNMENT_RE.search(text)
+    env_match = _ENV_ASSIGNMENT_RE.search(cleaned)
     if env_match and not _SAFE_PLACEHOLDER_RE.match(env_match.group(3)):
         return "secret_assignment"
     if check_luhn:
-        for match in _CARD_CANDIDATE_RE.finditer(text):
+        for match in _CARD_CANDIDATE_RE.finditer(cleaned):
             digits = "".join(ch for ch in match.group(0) if ch.isdigit())
             if _luhn_valid(digits):
                 return "payment_card"
@@ -84,9 +93,11 @@ def _scan_plaintext_secret_patterns(text: str, *, check_luhn: bool = True) -> Op
 
 def _scan_string_for_secret(text: str) -> Optional[str]:
     """Return secret category if ``text`` (or base64-encoded segments) contains a live credential."""
-    if not text or "[REDACTED" in text:
+    if not text:
         return None
-    normalized = _normalize_for_inspection(text)
+    normalized = _strip_redacted_placeholders(_normalize_for_inspection(text))
+    if not normalized:
+        return None
     direct = _scan_plaintext_secret_patterns(normalized, check_luhn=True)
     if direct is not None:
         return direct
@@ -158,6 +169,11 @@ _PATH_KEYS = frozenset(
         "dest",
         "target_path",
         "paths",
+        "dir",
+        "directory",
+        "folder",
+        "cwd",
+        "working_directory",
     }
 )
 
@@ -174,7 +190,7 @@ _URL_KEYS = frozenset(
     }
 )
 
-_SQL_KEYS = frozenset({"sql", "query", "statement"})
+_SQL_KEYS = frozenset({"sql", "query", "statement", "sql_query", "query_text"})
 
 _SHELL_KEYS = frozenset({"command", "cmd", "script", "shell_command"})
 
@@ -210,7 +226,7 @@ _DROP_OR_TRUNCATE_RE = re.compile(
 )
 
 _DELETE_STMT_RE = re.compile(
-    r"\bDELETE\s+FROM\s+[A-Za-z0-9_`\"\.]+(?:\s*;|\s*$)",
+    r"\bDELETE\s+FROM\s+[A-Za-z0-9_`\"\.]+\b(?![\s\S]*\bWHERE\b)",
     re.IGNORECASE,
 )
 
@@ -241,8 +257,9 @@ _SQL_BLOCK_COMMENT_RE = re.compile(r"/\*[\s\S]*?\*/")
 _SQL_LINE_COMMENT_RE = re.compile(r"--[^\n\r]*")
 
 _SQL_TAUTOLOGY_WHERE_RE = re.compile(
-    r"\b(?:DELETE\s+FROM|UPDATE\s+[A-Za-z0-9_`\"\.]+[\s\S]*?\bSET)\b[\s\S]*?\bWHERE\s+"
-    r"(?:TRUE|1\s*=\s*1|'([^']+)'\s*=\s*'\1'|([A-Za-z0-9_]+)\s*=\s*\2)\s*(?:;|$)",
+    r"\b(?:DELETE\s+FROM|UPDATE\s+[A-Za-z0-9_`\"\.]+[\s\S]*?\bSET)\b[\s\S]*?\bWHERE\b"
+    r"(?:[\s\S]*?\bOR\s+|\s+)"
+    r"(?:TRUE|1\s*=\s*1|'([^']+)'\s*=\s*'\1'|([A-Za-z0-9_]+)\s*=\s*\2)(?=\s|;|$|\))",
     re.IGNORECASE,
 )
 
@@ -417,9 +434,9 @@ def _check_destructive_shell(cmd: str) -> Optional[str]:
 
 
 def _leaf_key(arg_path: str) -> str:
-    """Extract normalized final dictionary key from a nested argument path."""
-    base = arg_path.split("[", 1)[0]
-    return base.rsplit(".", 1)[-1].lower()
+    """Extract normalized final dictionary key from a nested argument path (including lists of dicts)."""
+    tail = arg_path.rsplit(".", 1)[-1]
+    return tail.split("[", 1)[0].lower()
 
 
 def inspect_payload_safety(

@@ -12,7 +12,7 @@ Deterministic sub-millisecond protection for tool-calling AI agents:
 
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 from gatekeep.control_plane import (
     AuditVault,
