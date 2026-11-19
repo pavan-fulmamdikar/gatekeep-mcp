@@ -72,6 +72,11 @@ dev = [
 [project.scripts]
 gatekeep = "gatekeep.cli:main"
 
+[project.urls]
+Homepage = "https://github.com/pavan-fulmamdikar/gatekeep-mcp"
+Repository = "https://github.com/pavan-fulmamdikar/gatekeep-mcp"
+Issues = "https://github.com/pavan-fulmamdikar/gatekeep-mcp/issues"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["gatekeep*"]
