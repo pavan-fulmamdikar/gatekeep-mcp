@@ -438,8 +438,7 @@ def inspect_payload_safety(
     Returns:
         ``(rule_triggered, reason)`` when blocked, else ``None``.
     """
-    del tool_name  # Reserved for future tool-specific heuristics.
-    is_mutating = mode != "read"
+    del tool_name, mode  # Destructive SQL/shell, SSRF, and path guards apply to both read and write tools.
 
     for arg_path, text in _iter_arg_strings(args):
         key = _leaf_key(arg_path)
@@ -455,12 +454,12 @@ def inspect_payload_safety(
                 if ssrf_reason:
                     return "ssrf_blocked_target", ssrf_reason
 
-        if is_mutating and not allow_destructive_sql and key in _SQL_KEYS:
+        if not allow_destructive_sql and key in _SQL_KEYS:
             sql_reason = _check_destructive_sql(text)
             if sql_reason:
                 return "destructive_payload_blocked", sql_reason
 
-        if is_mutating and not allow_shell and key in _SHELL_KEYS:
+        if not allow_shell and key in _SHELL_KEYS:
             shell_reason = _check_destructive_shell(text)
             if shell_reason:
                 return "destructive_payload_blocked", shell_reason

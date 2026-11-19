@@ -147,8 +147,9 @@ python examples/multi_agent_gatekeep_runner.py
 # 4. Multi-tenant HTTP Gateway + HITL approval flow
 python examples/http_gateway_hitl_demo.py
 
-# 5. Live Field Test against unmodified third-party MCP server (@modelcontextprotocol/server-filesystem via npx)
-python examples/field_test_third_party_mcp.py
+# 5. Live Field Tests against unmodified third-party MCP servers (via npx)
+python examples/field_test_third_party_mcp.py   # @modelcontextprotocol/server-filesystem
+python examples/field_test_postgres_mcp.py      # @modelcontextprotocol/server-postgres + live PG 16
 ```
 
 ---
@@ -163,10 +164,9 @@ python examples/field_test_third_party_mcp.py
   - `SQLiteSessionStore` WAL (`c=10`, 400 mixed reqs): **`96.5 req/s`**, `p50=104.7ms`, `p95=141.3ms`, `/healthz` `p50=39.6ms`, `0` HTTP errors, `100/100` attacks blocked, RSS `56.4 -> 64.9 MiB` (`70.6 req/s` at `c=25`).
   - `RedisSessionStore` live Redis 7 container (`c=15`, 400 mixed reqs): **`49.4 req/s`**, `p50=258.2ms`, `p95=590.7ms`, `0` HTTP errors, `100/100` attacks blocked, RSS `68.0 -> 89.0 MiB`.
   - `PostgresSessionStore` live PostgreSQL 16 container + `psycopg_pool` (`c=15`, 400 mixed reqs): **`30.6 req/s`**, `p50=514.0ms`, `p95=707.5ms`, `0` HTTP errors, `100/100` attacks blocked, RSS `67.4 -> 89.0 MiB`.
-- **Live Third-Party MCP Server Field Test ([field_test_third_party_mcp.py](examples/field_test_third_party_mcp.py)):**
-  - Wrapped unmodified Anthropic `@modelcontextprotocol/server-filesystem` over real `npx` stdio (`16` real tools auto-classified by `generate_starter_policy()`).
-  - Enforcing mode: `3/3` benign operations allowed (`list_directory`, `read_text_file`, `write_file`), `4/4` live attacks blocked before reaching Node.js (`../../etc/passwd`, `.env.production`, `.ssh/id_rsa`, outbound AWS key DLP in `write_file`), **`0.463ms` median Gatekeep evaluation latency** (`0.694ms` max), valid SHA-256 audit chain (`7` receipts).
-  - Shadow mode also accurately demonstrated real-world prompt-intent behavior: vague user prompts (`"Work with files in ..."`) surfaced `unsolicited_tainted_write` shadow flags on `write_file`/`edit_file` without blocking execution (`14.1ms` median e2e).
+- **Live Third-Party MCP Server Field Tests ([field_test_third_party_mcp.py](examples/field_test_third_party_mcp.py) & [field_test_postgres_mcp.py](examples/field_test_postgres_mcp.py)):**
+  - **`@modelcontextprotocol/server-filesystem` (real `npx` stdio):** Discovered `16` real tools (`generate_starter_policy()`); enforcing mode allowed `3/3` benign ops (`list_directory`, `read_text_file`, `write_file`) and blocked `4/4` live attacks (`../../etc/passwd`, `.env.production`, `.ssh/id_rsa`, outbound AWS key DLP) before reaching Node.js (`0.463ms` median Gatekeep eval, valid SHA-256 chain). Shadow mode also accurately surfaced `unsolicited_tainted_write` flags under vague prompts (`"Work with files in ..."`).
+  - **`@modelcontextprotocol/server-postgres` (real `npx` stdio + live Docker PostgreSQL 16):** Discovered `query(sql=...)`; allowed `2/2` real `SELECT` queries and blocked `5/5` destructive SQL attacks (`DROP TABLE`, un-`WHERE`'d `DELETE`, `WHERE 1=1` `UPDATE`, comment-obfuscated stacked `; DROP`, `TRUNCATE`) in `0.085ms` median Gatekeep eval before reaching Node.js or PostgreSQL (`3/3` table rows intact, valid SHA-256 chain). *(This live test caught and fixed a real bypass where destructive SQL/shell guards were skipped on tools inferred as `mode="read"`, like `query`.)*
 - **Zero-Help Live Multi-Agent Stress Findings (`groq / openai/gpt-oss-120b`):**
   Running an uncoached autonomous coordinator with unfiltered tools across hostile workspace SOP traps added **`0.30–0.35ms` p50** Gatekeep overhead, blocked `.env.secrets`, IMDS `169.254.169.254`, `VENDOR-EVIL-99`, and leaked `Bearer` exfiltration, and cleanly reverted SQLite rows on `503` failures.
 
