@@ -12,6 +12,10 @@
   <code>MIT / Apache-2.0</code>
 </p>
 
+<p align="center">
+  <img src="assets/gatekeep_demo_45s.gif" alt="Gatekeep 45-second live demo: real MCP filesystem firewall and automatic LIFO Saga rollback" width="820" />
+</p>
+
 ---
 
 ## Why Gatekeep Exists (In 15 Seconds)
