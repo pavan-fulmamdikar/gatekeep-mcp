@@ -3,13 +3,13 @@ services:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-slim}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-slim_dev_password}
-      POSTGRES_DB: ${POSTGRES_DB:-slim_gatekeep}
+      POSTGRES_USER: ${POSTGRES_USER:-gatekeep}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gatekeep_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-gatekeep}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-slim} -d ${POSTGRES_DB:-slim_gatekeep}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gatekeep} -d ${POSTGRES_DB:-gatekeep}"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -35,23 +35,27 @@ services:
       redis:
         condition: service_healthy
     ports:
-      - "${SLIM_PORT:-8080}:8080"
+      - "${GATEKEEP_PORT:-8080}:8080"
     environment:
-      SLIM_SLACK_SIGNING_SECRET: ${SLIM_SLACK_SIGNING_SECRET:-}
+      GATEKEEP_SLACK_SIGNING_SECRET: ${GATEKEEP_SLACK_SIGNING_SECRET:-}
+      GATEKEEP_JWT_SECRET: ${GATEKEEP_JWT_SECRET:-}
     volumes:
       - ./examples:/examples:ro
       - gateway_data:/data
     command:
       - "--upstream"
-      - "${SLIM_UPSTREAM:-https://example-mcp.internal/mcp}"
+      - "${GATEKEEP_UPSTREAM:-https://example-mcp.internal/mcp}"
       - "--pg-dsn"
-      - "postgresql://${POSTGRES_USER:-slim}:${POSTGRES_PASSWORD:-slim_dev_password}@postgres:5432/${POSTGRES_DB:-slim_gatekeep}"
+      - "postgresql://${POSTGRES_USER:-gatekeep}:${POSTGRES_PASSWORD:-gatekeep_dev_password}@postgres:5432/${POSTGRES_DB:-gatekeep}"
+      - "--redis-url"
+      - "redis://redis:6379/0"
+      - "--asgi"
       - "--http"
       - "0.0.0.0:8080"
       - "--recovery-interval"
       - "30"
       - "--api-key"
-      - "${SLIM_API_KEY:-dev=change_me_before_prod}"
+      - "${GATEKEEP_API_KEY:-dev=change_me_before_prod}"
 
 volumes:
   pgdata:

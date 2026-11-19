@@ -535,8 +535,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if getattr(args, "http", None):
             host, port = parse_http_bind(args.http)
             principals = _build_principals_from_args(args)
-            slack_secret = args.slack_signing_secret or os.environ.get("SLIM_SLACK_SIGNING_SECRET")
-            jwt_secret = args.jwt_secret or os.environ.get("SLIM_JWT_SECRET")
+            slack_secret = (
+                args.slack_signing_secret
+                or os.environ.get("GATEKEEP_SLACK_SIGNING_SECRET")
+                or os.environ.get("SLIM_SLACK_SIGNING_SECRET")
+            )
+            jwt_secret = (
+                args.jwt_secret
+                or os.environ.get("GATEKEEP_JWT_SECRET")
+                or os.environ.get("SLIM_JWT_SECRET")
+            )
             sse_pubsub_client = None
             if getattr(args, "pg_dsn", None) and getattr(args, "redis_url", None):
                 try:
