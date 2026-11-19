@@ -1075,6 +1075,7 @@ class PostgresSessionStore(SessionStateStore):
     ) -> Tuple[Optional[Any], Optional[Any]]:
         """Prefer `psycopg_pool.ConnectionPool` for multi-request concurrency, falling back to single conn."""
         try:
+            import psycopg  # type: ignore  # noqa: F401
             from psycopg_pool import ConnectionPool  # type: ignore
 
             return (
@@ -1337,41 +1338,75 @@ class PostgresSessionStore(SessionStateStore):
         updater: Callable[[Dict[str, Any]], Tuple[bool, Dict[str, Any], Any]],
     ) -> Tuple[bool, Any]:
         ns = str(namespace)
-        with self.session_lock(f"__cp__:{ns}"):
+        key = self._advisory_key(f"__cp__:{ns}")
+        deadline = time.monotonic() + 10.0
+
+        while time.monotonic() < deadline:
             with self._connection() as conn:
                 cur = conn.cursor()
-                began = False
                 try:
-                    began = self._begin(conn, cur)
-                    cur.execute(
-                        f"SELECT payload FROM {self._cp_table} WHERE namespace = %s",
-                        (ns,),
-                    )
+                    cur.execute("SELECT pg_try_advisory_lock(%s)", (key,))
                     row = cur.fetchone()
-                    curr_doc = json.loads(row[0]) if row is not None else {}
-                    ok, new_doc, meta = updater(
-                        dict(curr_doc) if isinstance(curr_doc, dict) else {}
-                    )
-                    if ok:
-                        payload = _encode_json(new_doc)
-                        now = time.time()
-                        cur.execute(
-                            f"""
-                            INSERT INTO {self._cp_table} (namespace, payload, updated_at)
-                            VALUES (%s, %s, %s)
-                            ON CONFLICT (namespace) DO UPDATE SET
-                                payload = EXCLUDED.payload,
-                                updated_at = EXCLUDED.updated_at
-                            """,
-                            (ns, payload, now),
-                        )
-                    self._commit(conn, cur, began)
-                    return bool(ok), meta
-                except Exception:
-                    self._rollback(conn, cur, began)
-                    raise
+                    acquired = bool(row and row[0])
+                    if not getattr(conn, "autocommit", False):
+                        conn.commit()
                 finally:
                     cur.close()
+
+                if acquired:
+                    try:
+                        cur = conn.cursor()
+                        began = False
+                        try:
+                            began = self._begin(conn, cur)
+                            cur.execute(
+                                f"SELECT payload FROM {self._cp_table} WHERE namespace = %s",
+                                (ns,),
+                            )
+                            row = cur.fetchone()
+                            curr_doc = json.loads(row[0]) if row is not None else {}
+                            ok, new_doc, meta = updater(
+                                dict(curr_doc) if isinstance(curr_doc, dict) else {}
+                            )
+                            if ok:
+                                payload = _encode_json(new_doc)
+                                now = time.time()
+                                cur.execute(
+                                    f"""
+                                    INSERT INTO {self._cp_table} (namespace, payload, updated_at)
+                                    VALUES (%s, %s, %s)
+                                    ON CONFLICT (namespace) DO UPDATE SET
+                                        payload = EXCLUDED.payload,
+                                        updated_at = EXCLUDED.updated_at
+                                    """,
+                                    (ns, payload, now),
+                                )
+                            self._commit(conn, cur, began)
+                            return bool(ok), meta
+                        except Exception:
+                            self._rollback(conn, cur, began)
+                            raise
+                        finally:
+                            cur.close()
+                    finally:
+                        cur = conn.cursor()
+                        try:
+                            cur.execute("SELECT pg_advisory_unlock(%s)", (key,))
+                            if not getattr(conn, "autocommit", False):
+                                conn.commit()
+                        except Exception:
+                            try:
+                                conn.rollback()
+                            except Exception:
+                                pass
+                        finally:
+                            cur.close()
+
+            time.sleep(0.015)
+
+        raise TimeoutError(
+            f"Timed out after 10.0s acquiring Postgres control-doc lock for '{ns}'."
+        )
 
     def append_audit_receipt(self, receipt_dict: Dict[str, Any]) -> None:
         payload = _encode_json(receipt_dict)
@@ -1446,6 +1481,64 @@ class PostgresSessionStore(SessionStateStore):
     def session_lock(self, session_id: str, timeout_s: float = 10.0) -> Iterator[None]:
         key = self._advisory_key(session_id)
         deadline = time.monotonic() + timeout_s
+        if (
+            self._pool is not None
+            and hasattr(self._pool, "getconn")
+            and hasattr(self._pool, "putconn")
+        ):
+            lock_conn: Optional[Any] = None
+            while time.monotonic() < deadline:
+                conn = self._pool.getconn()
+                try:
+                    cur = conn.cursor()
+                    try:
+                        cur.execute("SELECT pg_try_advisory_lock(%s)", (key,))
+                        row = cur.fetchone()
+                        acquired = bool(row and row[0])
+                        if not getattr(conn, "autocommit", False):
+                            conn.commit()
+                    finally:
+                        cur.close()
+                    if acquired:
+                        lock_conn = conn
+                        break
+                except Exception:
+                    try:
+                        self._pool.putconn(conn)
+                    except Exception:
+                        pass
+                    raise
+                self._pool.putconn(conn)
+                time.sleep(0.015)
+
+            if lock_conn is None:
+                raise TimeoutError(
+                    f"Timed out after {timeout_s}s acquiring Postgres advisory lock for '{session_id}'."
+                )
+
+            try:
+                yield
+            finally:
+                try:
+                    cur = lock_conn.cursor()
+                    try:
+                        cur.execute("SELECT pg_advisory_unlock(%s)", (key,))
+                        if not getattr(lock_conn, "autocommit", False):
+                            lock_conn.commit()
+                    except Exception:
+                        try:
+                            lock_conn.rollback()
+                        except Exception:
+                            pass
+                    finally:
+                        cur.close()
+                finally:
+                    try:
+                        self._pool.putconn(lock_conn)
+                    except Exception:
+                        pass
+            return
+
         with self._connection() as conn:
             acquired = False
             while time.monotonic() < deadline:

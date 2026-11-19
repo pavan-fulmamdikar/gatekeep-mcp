@@ -8,7 +8,7 @@
 #
 # Quickstart:
 #   docker compose -f docker-compose.ha.yml up -d
-#   GATEKEEP_LIVE_PG_DSN=postgresql://gatekeep:gatekeep_dev@localhost:5432/gatekeep \
+#   GATEKEEP_LIVE_PG_DSN=postgresql://gatekeep:gatekeep_dev@localhost:5439/gatekeep \
 #   GATEKEEP_LIVE_REDIS_URL=redis://localhost:6379/0 \
 #   pytest tests/test_ha_postgres_redis_integration.py -v
 
@@ -20,7 +20,7 @@ services:
       POSTGRES_PASSWORD: gatekeep_dev
       POSTGRES_DB: gatekeep
     ports:
-      - "5432:5432"
+      - "${GATEKEEP_PG_PORT:-5439}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U gatekeep -d gatekeep"]
       interval: 3s

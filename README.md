@@ -148,12 +148,13 @@ python examples/field_test_third_party_mcp.py
 ## Benchmarks & Honest Limitations
 
 ### Local Verification (`pytest tests/`, Live `uvicorn` Load, & Real Third-Party MCP Field Test)
-- **Unit & Runtime Scaling Suite:** `127 passed` (`tests/test_runtime_scaling.py` verifies O(1) `count_sessions()`, auto `psycopg_pool.ConnectionPool`, non-blocking async cross-session concurrency, pooled `httpx.AsyncClient`, and cross-replica Redis Pub/Sub SSE fan-out with origin self-echo suppression; `tests/test_ha_postgres_redis_integration.py` runs 4 live PostgreSQL 16 + Redis 7 multi-replica soak tests when `GATEKEEP_LIVE_PG_DSN` / `GATEKEEP_LIVE_REDIS_URL` are set).
+- **Unit, Runtime Scaling & Live HA Container Suite:** **`131 passed`** (`tests/test_runtime_scaling.py` verifies O(1) `count_sessions()`, auto `psycopg_pool.ConnectionPool`, non-blocking async cross-session concurrency, pooled `httpx.AsyncClient`, and cross-replica Redis Pub/Sub SSE fan-out; `tests/test_ha_postgres_redis_integration.py` passes **4/4 live non-mocked multi-replica tests** against real PostgreSQL 16 + Redis 7 containers in `docker-compose.ha.yml`).
 - **70-Scenario Security & False-Positive Suite ([bench_adversarial_security.py](benchmarks/bench_adversarial_security.py)):** `35/35 (100.0%)` synthetic attacks mitigated, `35/35` legitimate workflows allowed (`0.0%` false-block rate), **`~2–5ms` p50** proxy+SQLite latency.
-- **Live `uvicorn` ASGI HTTP Load Benchmark ([bench_http_load.py](benchmarks/bench_http_load.py), single worker sharing loopback host with `httpx` client):**
-  - `InMemorySessionStore` (`c=10`, 400 mixed reqs): **`121.5 req/s`**, `p50=70.7ms`, `p95=145.4ms`, `0` HTTP errors, `100/100` attacks blocked, RSS `54.8 -> 59.0 MiB`.
-  - `SQLiteSessionStore` WAL (`c=10`, 400 mixed reqs): **`96.5 req/s`**, `p50=104.7ms`, `p95=141.3ms`, `/healthz` `p50=39.6ms`, `0` HTTP errors, `100/100` attacks blocked, RSS `56.4 -> 64.9 MiB`.
-  - Burst (`c=25–30`, 500–600 reqs): **`104.9 req/s`** (memory) / **`70.6 req/s`** (SQLite WAL), `0` HTTP errors, `100%` attack block rate. Scale horizontally with `--asgi` multi-worker / Kubernetes pods backed by PostgreSQL 16 + Redis 7.
+- **Live `uvicorn` ASGI HTTP Load Benchmark ([bench_http_load.py](benchmarks/bench_http_load.py), single worker sharing Windows loopback host with `httpx` client across all 4 storage backends):**
+  - `InMemorySessionStore` (`c=10`, 400 mixed reqs): **`121.5 req/s`**, `p50=70.7ms`, `p95=145.4ms`, `0` HTTP errors, `100/100` attacks blocked, RSS `54.8 -> 59.0 MiB` (`104.9 req/s` at `c=30`).
+  - `SQLiteSessionStore` WAL (`c=10`, 400 mixed reqs): **`96.5 req/s`**, `p50=104.7ms`, `p95=141.3ms`, `/healthz` `p50=39.6ms`, `0` HTTP errors, `100/100` attacks blocked, RSS `56.4 -> 64.9 MiB` (`70.6 req/s` at `c=25`).
+  - `RedisSessionStore` live Redis 7 container (`c=15`, 400 mixed reqs): **`49.4 req/s`**, `p50=258.2ms`, `p95=590.7ms`, `0` HTTP errors, `100/100` attacks blocked, RSS `68.0 -> 89.0 MiB`.
+  - `PostgresSessionStore` live PostgreSQL 16 container + `psycopg_pool` (`c=15`, 400 mixed reqs): **`30.6 req/s`**, `p50=514.0ms`, `p95=707.5ms`, `0` HTTP errors, `100/100` attacks blocked, RSS `67.4 -> 89.0 MiB`.
 - **Live Third-Party MCP Server Field Test ([field_test_third_party_mcp.py](examples/field_test_third_party_mcp.py)):**
   - Wrapped unmodified Anthropic `@modelcontextprotocol/server-filesystem` over real `npx` stdio (`16` real tools auto-classified by `generate_starter_policy()`).
   - Enforcing mode: `3/3` benign operations allowed (`list_directory`, `read_text_file`, `write_file`), `4/4` live attacks blocked before reaching Node.js (`../../etc/passwd`, `.env.production`, `.ssh/id_rsa`, outbound AWS key DLP in `write_file`), **`0.463ms` median Gatekeep evaluation latency** (`0.694ms` max), valid SHA-256 audit chain (`7` receipts).
@@ -179,7 +180,7 @@ python benchmarks/bench_http_load.py --store sqlite --requests 500 --concurrency
 
 # Live Multi-Replica PostgreSQL 16 + Redis 7 HA Soak Tests (requires Docker):
 docker compose -f docker-compose.ha.yml up -d postgres redis
-GATEKEEP_LIVE_PG_DSN=postgresql://gatekeep:gatekeep_dev@localhost:5432/gatekeep \
+GATEKEEP_LIVE_PG_DSN=postgresql://gatekeep:gatekeep_dev@localhost:5439/gatekeep \
 GATEKEEP_LIVE_REDIS_URL=redis://localhost:6379/0 \
 pytest tests/test_ha_postgres_redis_integration.py -v
 ```

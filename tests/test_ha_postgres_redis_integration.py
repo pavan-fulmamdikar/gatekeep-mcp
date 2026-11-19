@@ -207,7 +207,7 @@ def test_live_postgres_saga_crash_recovery_sweep():
                 tool_name="reserve_slot",
                 mode="write",
                 compensates_with="release_slot",
-                compensation_args={"slot_id": "$args.slot_id"},
+                compensation_args={"slot_id": "{args.slot_id}"},
             )
         )
         up = AsyncCallableMCPUpstream(tools=tools, executor=_exec)

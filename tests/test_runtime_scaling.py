@@ -327,6 +327,8 @@ def test_postgres_auto_creates_connection_pool_and_o1_count(monkeypatch: pytest.
     fake_mod = types.ModuleType("psycopg_pool")
     fake_mod.ConnectionPool = _RecordingPool  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "psycopg_pool", fake_mod)
+    if sys.modules.get("psycopg") is None:
+        monkeypatch.setitem(sys.modules, "psycopg", types.ModuleType("psycopg"))
 
     store = PostgresSessionStore(
         dsn="postgresql://user:pass@localhost:5432/gatekeep",
