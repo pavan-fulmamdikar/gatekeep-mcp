@@ -36,6 +36,10 @@ import tracemalloc
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+_REPO_ROOT = str(Path(__file__).resolve().parents[1])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 from gatekeep import (
     AsyncCallableMCPUpstream,
     CentralPolicyRegistry,

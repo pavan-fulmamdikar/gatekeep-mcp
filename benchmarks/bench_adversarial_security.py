@@ -17,11 +17,16 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+_REPO_ROOT = str(Path(__file__).resolve().parents[1])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import httpx
 
