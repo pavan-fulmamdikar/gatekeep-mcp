@@ -17,16 +17,18 @@ tamper-evident, SHA-256 hash-chained `AuditReceipt`.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import inspect
 import json
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from gatekeep.ledger import (
     ToolReturnLedger,
@@ -88,14 +90,25 @@ class AuditReceipt:
     would_verdict: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        d = asdict(self)
-        d["verdict"] = self.verdict.value
-        if self.actor_id is None:
-            d.pop("actor_id", None)
-        if not self.shadow:
-            d.pop("shadow", None)
-        if self.would_verdict is None:
-            d.pop("would_verdict", None)
+        d: Dict[str, Any] = {
+            "timestamp": self.timestamp,
+            "session_id": self.session_id,
+            "turn": self.turn,
+            "tool_name": self.tool_name,
+            "arguments": self.arguments,
+            "verdict": self.verdict.value,
+            "rule_triggered": self.rule_triggered,
+            "reason": self.reason,
+            "latency_ms": self.latency_ms,
+            "prev_hash": self.prev_hash,
+            "receipt_hash": self.receipt_hash,
+        }
+        if self.actor_id is not None:
+            d["actor_id"] = self.actor_id
+        if self.shadow:
+            d["shadow"] = True
+        if self.would_verdict is not None:
+            d["would_verdict"] = self.would_verdict
         return d
 
     @classmethod
@@ -239,13 +252,45 @@ class PreExecutionGate:
         self._cumulative_session_spend: float = 0.0
         self._recorded_spends: List[Tuple[str, float, Optional[str], bool]] = []
 
+        self._auto_save_depth: int = 0
+        self._auto_save_dirty: bool = False
+
         if self.session_store is not None and self.auto_persist:
             self.ledger._on_change = self._maybe_auto_save
 
+    @contextmanager
+    def batch_save(self, *, flush: bool = True) -> Iterator[None]:
+        """Coalesce multiple internal state mutations into a single atomic `save()` on exit."""
+        with self._lock:
+            self._auto_save_depth += 1
+        try:
+            yield
+        finally:
+            should_flush = False
+            with self._lock:
+                self._auto_save_depth = max(0, self._auto_save_depth - 1)
+                if flush and self._auto_save_depth == 0 and self._auto_save_dirty:
+                    self._auto_save_dirty = False
+                    should_flush = True
+            if should_flush and self.session_store is not None and self.auto_persist:
+                self.save()
+
+    def _consume_dirty_save(self) -> bool:
+        """Atomically read and clear deferred auto-save dirty flag (for async callers)."""
+        with self._lock:
+            dirty = bool(self._auto_save_dirty)
+            self._auto_save_dirty = False
+            return dirty and self.session_store is not None and self.auto_persist
+
     def _maybe_auto_save(self) -> None:
         """Automatically flush session state to `session_store` when configured."""
-        if self.session_store is not None and self.auto_persist:
-            self.save()
+        if self.session_store is None or not self.auto_persist:
+            return
+        with self._lock:
+            if self._auto_save_depth > 0:
+                self._auto_save_dirty = True
+                return
+        self.save()
 
     def save(
         self,
@@ -1434,6 +1479,16 @@ class PreExecutionGate:
             t0, tool_name, eff_tool, args, approval_token, fail_count, actor_id=actor_id
         )
 
+    def _needs_async_thread_offload(self) -> bool:
+        """Return True if sync evaluation performs disk/network I/O that could stall an event loop."""
+        if self.resolve_dns_for_ssrf:
+            return True
+        if self.session_store is None:
+            return False
+        from gatekeep.persistence import InMemorySessionStore
+
+        return not isinstance(self.session_store, InMemorySessionStore)
+
     async def aevaluate(
         self,
         tool_name: str,
@@ -1443,45 +1498,74 @@ class PreExecutionGate:
     ) -> GateDecision:
         """
         Asynchronously evaluate a proposed tool call prior to execution,
-        supporting both synchronous and `async def` check predicates.
+        supporting both synchronous and `async def` check predicates without
+        blocking the asyncio event loop on disk/network session store I/O.
         """
         t0 = time.perf_counter()
         args = dict(arguments) if isinstance(arguments, dict) else {}
         eff_tool = self._resolve_effective_tool(tool_name)
+        check_fn = getattr(eff_tool, "check", None)
+        offload = self._needs_async_thread_offload()
 
-        pre_decision, fail_count = self._evaluate_pre_checks(
-            t0, tool_name, eff_tool, args, actor_id=actor_id
-        )
+        if not (callable(check_fn) and inspect.iscoroutinefunction(check_fn)):
+            if offload:
+                return await asyncio.to_thread(
+                    self.evaluate, tool_name, args, approval_token, actor_id
+                )
+            return self.evaluate(
+                tool_name, args, approval_token=approval_token, actor_id=actor_id
+            )
+
+        if offload:
+            pre_decision, fail_count = await asyncio.to_thread(
+                self._evaluate_pre_checks, t0, tool_name, eff_tool, args, actor_id
+            )
+        else:
+            pre_decision, fail_count = self._evaluate_pre_checks(
+                t0, tool_name, eff_tool, args, actor_id=actor_id
+            )
         if pre_decision is not None:
             return pre_decision
 
-        check_fn = getattr(eff_tool, "check", None)
-        if callable(check_fn):
-            passed, check_reason = await self._ainvoke_check(check_fn, tool_name, args)
-            if not passed:
-                fk = self._failure_key(
-                    tool_name, infer_tool_mode(tool_name, getattr(eff_tool, "mode", None)), args
-                )
-                with self._lock:
-                    self._failure_counts[fk] = fail_count + 1
-                relevant_facts = self._extract_relevant_facts(eff_tool, args)
-                return self._finalize(
-                    t0=t0,
-                    tool_name=tool_name,
-                    args=args,
-                    verdict=Verdict.REVISE,
-                    rule_triggered="tool_state_predicate",
-                    reason=check_reason or (
-                        f"State predicate check failed on '{tool_name}' with arguments {args}."
-                    ),
-                    instruction=(
-                        "Revise the tool arguments to satisfy the observed session state "
-                        "shown in `ledger_facts`, then retry."
-                    ),
-                    ledger_facts=relevant_facts,
-                    actor_id=actor_id,
-                )
+        passed, check_reason = await self._ainvoke_check(check_fn, tool_name, args)
+        if not passed:
+            fk = self._failure_key(
+                tool_name, infer_tool_mode(tool_name, getattr(eff_tool, "mode", None)), args
+            )
+            with self._lock:
+                self._failure_counts[fk] = fail_count + 1
+            relevant_facts = self._extract_relevant_facts(eff_tool, args)
+            finalize_kwargs = dict(
+                t0=t0,
+                tool_name=tool_name,
+                args=args,
+                verdict=Verdict.REVISE,
+                rule_triggered="tool_state_predicate",
+                reason=check_reason or (
+                    f"State predicate check failed on '{tool_name}' with arguments {args}."
+                ),
+                instruction=(
+                    "Revise the tool arguments to satisfy the observed session state "
+                    "shown in `ledger_facts`, then retry."
+                ),
+                ledger_facts=relevant_facts,
+                actor_id=actor_id,
+            )
+            if offload:
+                return await asyncio.to_thread(lambda: self._finalize(**finalize_kwargs))
+            return self._finalize(**finalize_kwargs)
 
+        if offload:
+            return await asyncio.to_thread(
+                self._evaluate_post_checks,
+                t0,
+                tool_name,
+                eff_tool,
+                args,
+                approval_token,
+                fail_count,
+                actor_id,
+            )
         return self._evaluate_post_checks(
             t0, tool_name, eff_tool, args, approval_token, fail_count, actor_id=actor_id
         )

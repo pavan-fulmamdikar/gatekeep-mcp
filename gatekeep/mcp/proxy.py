@@ -388,6 +388,9 @@ class HttpMCPUpstream(MCPUpstream):
         self._sse_closed = threading.Event()
         self._sse_waiters: Dict[Any, queue.Queue] = {}
 
+        # Optional per-event-loop pooled `httpx.AsyncClient` for non-blocking Streamable HTTP
+        self._async_clients: Dict[int, Tuple[Any, asyncio.Lock]] = {}
+
     def _build_headers(self, accept: str = "application/json, text/event-stream") -> Dict[str, str]:
         req_headers = {
             "Content-Type": "application/json",
@@ -551,6 +554,139 @@ class HttpMCPUpstream(MCPUpstream):
                         raise
             return self._send_and_recv(method, params or {})
 
+    def _next_request_id(self) -> int:
+        with self._lock:
+            req_id = self._next_id
+            self._next_id += 1
+            return req_id
+
+    def _get_async_http_client(self) -> Optional[Tuple[Any, asyncio.Lock]]:
+        """Lazily create a per-loop pooled `httpx.AsyncClient` when `httpx` is installed."""
+        try:
+            import httpx  # type: ignore
+        except ImportError:
+            return None
+        loop_id = id(asyncio.get_running_loop())
+        with self._lock:
+            existing = self._async_clients.get(loop_id)
+            if existing is not None:
+                client, init_lock = existing
+                if not getattr(client, "is_closed", False):
+                    return client, init_lock
+            client = httpx.AsyncClient(
+                timeout=self.timeout_s,
+                limits=httpx.Limits(max_connections=100, max_keepalive_connections=40),
+            )
+            init_lock = asyncio.Lock()
+            self._async_clients[loop_id] = (client, init_lock)
+            return client, init_lock
+
+    async def _apost_frame(
+        self,
+        client: Any,
+        target_url: str,
+        payload: Dict[str, Any],
+        *,
+        expect_reply: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        resp = await client.post(
+            target_url,
+            content=json.dumps(payload).encode("utf-8"),
+            headers=self._build_headers(),
+        )
+        sid = resp.headers.get("Mcp-Session-Id") or resp.headers.get("mcp-session-id")
+        if sid:
+            self._session_id = sid
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        body_text = resp.text
+
+        if resp.status_code >= 400:
+            try:
+                parsed = json.loads(body_text)
+                if isinstance(parsed, dict) and "error" in parsed:
+                    return parsed
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Upstream HTTP {resp.status_code} from {target_url}: {body_text}"
+            )
+
+        if not expect_reply or not body_text.strip():
+            return None
+        if "text/event-stream" in ctype:
+            msgs = _parse_sse_json_messages(body_text)
+            req_id = payload.get("id")
+            for msg in msgs:
+                if req_id is not None and msg.get("id") == req_id:
+                    return msg
+            return msgs[-1] if msgs else None
+        return json.loads(body_text)
+
+    async def _arequest_streamable(
+        self, method: str, params: Optional[Dict[str, Any]] = None
+    ) -> Any:
+        pair = self._get_async_http_client()
+        if pair is None:
+            return await asyncio.to_thread(self._request, method, params)
+        client, init_lock = pair
+
+        if not self._initialized and method != "initialize":
+            async with init_lock:
+                if not self._initialized:
+                    self._initialized = True
+                    try:
+                        init_id = self._next_request_id()
+                        init_msg = await self._apost_frame(
+                            client,
+                            self.url,
+                            {
+                                "jsonrpc": "2.0",
+                                "id": init_id,
+                                "method": "initialize",
+                                "params": {
+                                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                                    "capabilities": {},
+                                    "clientInfo": {
+                                        "name": "slim-schema-mcp-proxy",
+                                        "version": "0.2.0",
+                                    },
+                                },
+                            },
+                            expect_reply=True,
+                        )
+                        if init_msg and "error" in init_msg and init_msg["error"] is not None:
+                            raise RuntimeError(f"Upstream MCP error: {init_msg['error']}")
+                        await self._apost_frame(
+                            client,
+                            self.url,
+                            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                            expect_reply=False,
+                        )
+                    except RuntimeError as exc:
+                        if "-32601" not in str(exc):
+                            self._initialized = False
+                            raise
+
+        req_id = self._next_request_id()
+        msg = await self._apost_frame(
+            client,
+            self.url,
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": method,
+                "params": params or {},
+            },
+            expect_reply=True,
+        )
+        if not msg:
+            raise RuntimeError(
+                f"Empty JSON-RPC response from {self.url} for method '{method}'."
+            )
+        if "error" in msg and msg["error"] is not None:
+            raise RuntimeError(f"Upstream MCP error: {msg['error']}")
+        return msg.get("result")
+
     def list_tools(self) -> List[Dict[str, Any]]:
         res = self._request("tools/list", {}) or {}
         if isinstance(res, list):
@@ -560,12 +696,35 @@ class HttpMCPUpstream(MCPUpstream):
     def call_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
         return self._request("tools/call", {"name": name, "arguments": dict(arguments or {})})
 
+    async def acall_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
+        if self.transport == "streamable":
+            return await self._arequest_streamable(
+                "tools/call", {"name": name, "arguments": dict(arguments or {})}
+            )
+        return await asyncio.to_thread(self.call_tool, name, arguments)
+
     def list_resources(self) -> List[Dict[str, Any]]:
         res = self._request("resources/list", {}) or {}
         return list(res.get("resources", []))
 
     def read_resource(self, uri: str) -> Any:
         return self._request("resources/read", {"uri": uri})
+
+    async def aread_resource(self, uri: str) -> Any:
+        if self.transport == "streamable":
+            return await self._arequest_streamable("resources/read", {"uri": uri})
+        return await asyncio.to_thread(self.read_resource, uri)
+
+    async def aclose(self) -> None:
+        with self._lock:
+            clients = list(self._async_clients.values())
+            self._async_clients.clear()
+        for client, _lock in clients:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+        self.close()
 
     def close(self) -> None:
         self._sse_closed.set()
@@ -576,6 +735,8 @@ class HttpMCPUpstream(MCPUpstream):
                 pass
             self._sse_resp = None
         self._sse_post_url = None
+        with self._lock:
+            self._async_clients.clear()
 
     def __enter__(self) -> "HttpMCPUpstream":
         return self
@@ -1030,6 +1191,8 @@ class MCPTransactionProxy:
         name: str,
         arguments: Dict[str, Any],
         idempotency_key: Optional[str],
+        *,
+        persist: bool = True,
     ) -> Optional[str]:
         effective = self._effective_tool_spec(name)
         if not (self._is_mutating_spec(effective) or idempotency_key):
@@ -1045,7 +1208,10 @@ class MCPTransactionProxy:
             compensation_args=getattr(effective, "compensation_args", None) if effective else None,
             fingerprint=canonical_action_fingerprint(name, arguments),
         )
-        gate.save()
+        if persist:
+            gate.save()
+        else:
+            gate._auto_save_dirty = True
         return wal_id
 
     def _should_rollback_on_block(
@@ -1143,33 +1309,37 @@ class MCPTransactionProxy:
             if self.redactor is not None
             else ledger_payload
         )
-        gate.ledger.absorb_tool_return(
-            tool_name=name,
-            args=stored_args,
-            result=stored_result,
-            mode=getattr(effective, "mode", None) if effective else None,
-            provides=getattr(effective, "provides", None) if effective else None,
-            compensates_with=getattr(effective, "compensates_with", None) if effective else None,
-            compensation_args=getattr(effective, "compensation_args", None) if effective else None,
-            on_rollback=getattr(effective, "on_rollback", None) if effective else None,
-            registry=self.registry,
-        )
-        normalized = self._normalize_mcp_result(raw_result)
-        if decision is not None and decision.ledger_facts.get("shadow_would_verdict"):
-            normalized["_shadow"] = {
-                "would_verdict": decision.ledger_facts["shadow_would_verdict"],
-                "rule_triggered": decision.rule_triggered,
-                "reason": decision.reason,
-            }
-        if wal_id is not None:
-            gate.saga.finish_in_flight(
-                wal_id,
-                success=True,
-                idempotency_key=idempotency_key,
-                fingerprint=canonical_action_fingerprint(name, arguments),
-                cached_result=normalized,
+        with gate.batch_save():
+            gate.ledger.absorb_tool_return(
+                tool_name=name,
+                args=stored_args,
+                result=stored_result,
+                mode=getattr(effective, "mode", None) if effective else None,
+                provides=getattr(effective, "provides", None) if effective else None,
+                compensates_with=getattr(effective, "compensates_with", None) if effective else None,
+                compensation_args=getattr(effective, "compensation_args", None) if effective else None,
+                on_rollback=getattr(effective, "on_rollback", None) if effective else None,
+                registry=self.registry,
             )
-        gate.save()
+            normalized = self._normalize_mcp_result(raw_result)
+            if decision is not None and decision.ledger_facts.get("shadow_would_verdict"):
+                normalized["_shadow"] = {
+                    "would_verdict": decision.ledger_facts["shadow_would_verdict"],
+                    "rule_triggered": decision.rule_triggered,
+                    "reason": decision.reason,
+                }
+            if wal_id is not None:
+                gate.saga.finish_in_flight(
+                    wal_id,
+                    success=True,
+                    idempotency_key=idempotency_key,
+                    fingerprint=canonical_action_fingerprint(name, arguments),
+                    cached_result=normalized,
+                )
+            if not gate.auto_persist:
+                gate.save()
+            else:
+                gate._auto_save_dirty = True
         return normalized
 
     def _check_compromised_tool(
@@ -1278,6 +1448,15 @@ class MCPTransactionProxy:
                 decision=decision,
             )
 
+    def _store_needs_thread_offload(self) -> bool:
+        """Return True if persistence operations perform blocking disk/network I/O."""
+        return not isinstance(self.session_store, InMemorySessionStore)
+
+    async def _run_store_op(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        if self._store_needs_thread_offload():
+            return await asyncio.to_thread(fn, *args, **kwargs)
+        return fn(*args, **kwargs)
+
     async def ahandle_tools_call(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Handle MCP `tools/call` asynchronously with full Gatekeep & Saga lifecycle."""
         (
@@ -1290,25 +1469,44 @@ class MCPTransactionProxy:
             idempotency_key,
         ) = self._prepare_call_context(params)
 
-        with self.session_store.session_lock(session_id):
-            gate = self._load_gate(session_id)
-            if user_prompt:
-                gate.ledger.observe_user_input(str(user_prompt))
+        async with self.session_store.async_session_lock(session_id):
+            def _load_and_precheck() -> Tuple[PreExecutionGate, Optional[Dict[str, Any]], Optional[GateDecision]]:
+                g = self._load_gate(session_id)
+                if user_prompt:
+                    g.ledger.observe_user_input(str(user_prompt))
+                replay = self._check_idempotency_before_gate(
+                    g, name, arguments, idempotency_key, actor_id
+                )
+                if replay is not None:
+                    return g, replay, None
+                comp_dec = self._check_compromised_tool(g, name, arguments, actor_id)
+                return g, None, comp_dec
 
-            replay_resp = self._check_idempotency_before_gate(
-                gate, name, arguments, idempotency_key, actor_id
-            )
+            gate, replay_resp, decision = await self._run_store_op(_load_and_precheck)
             if replay_resp is not None:
                 return replay_resp
 
-            decision = self._check_compromised_tool(gate, name, arguments, actor_id)
-            if decision is None:
-                decision = await gate.aevaluate(
-                    tool_name=name,
-                    arguments=arguments,
-                    approval_token=approval_token,
-                    actor_id=actor_id,
-                )
+            with gate.batch_save(flush=False):
+                if decision is None:
+                    decision = await gate.aevaluate(
+                        tool_name=name,
+                        arguments=arguments,
+                        approval_token=approval_token,
+                        actor_id=actor_id,
+                    )
+                if not decision.allowed:
+                    wal_id = None
+                else:
+                    route = self._tool_routes.get(name)
+                    wal_id = (
+                        self._begin_wal_if_mutating(
+                            gate, name, arguments, idempotency_key, persist=False
+                        )
+                        if route is not None
+                        else None
+                    )
+            if gate._consume_dirty_save():
+                await self._run_store_op(gate.save)
             if not decision.allowed:
                 rb = (
                     await gate.arollback()
@@ -1326,7 +1524,6 @@ class MCPTransactionProxy:
 
             upstream_key, raw_name, _schema = route
             client = self._upstreams[upstream_key]
-            wal_id = self._begin_wal_if_mutating(gate, name, arguments, idempotency_key)
 
             try:
                 raw_result = await client.acall_tool(raw_name, arguments)
@@ -1335,24 +1532,39 @@ class MCPTransactionProxy:
                     gate.saga.finish_in_flight(wal_id, success=False)
                 rb = (
                     await gate.arollback()
-                    if self.auto_rollback_on_error and (gate.saga.pending_count > 0 or gate.saga.in_flight_count > 0)
+                    if self.auto_rollback_on_error
+                    and (gate.saga.pending_count > 0 or gate.saga.in_flight_count > 0)
                     else None
                 )
-                return self._format_upstream_failure(gate, name, exc, rb, is_exception=True)
+                return await self._run_store_op(
+                    self._format_upstream_failure,
+                    gate,
+                    name,
+                    exc,
+                    rb,
+                    is_exception=True,
+                )
 
             if self._is_upstream_error(raw_result):
                 if wal_id is not None:
                     gate.saga.finish_in_flight(wal_id, success=False)
                 rb = (
                     await gate.arollback()
-                    if self.auto_rollback_on_error and (gate.saga.pending_count > 0 or gate.saga.in_flight_count > 0)
+                    if self.auto_rollback_on_error
+                    and (gate.saga.pending_count > 0 or gate.saga.in_flight_count > 0)
                     else None
                 )
-                return self._format_upstream_failure(
-                    gate, name, raw_result, rb, is_exception=False
+                return await self._run_store_op(
+                    self._format_upstream_failure,
+                    gate,
+                    name,
+                    raw_result,
+                    rb,
+                    is_exception=False,
                 )
 
-            return self._absorb_and_normalize(
+            return await self._run_store_op(
+                self._absorb_and_normalize,
                 gate,
                 name,
                 arguments,
@@ -1412,7 +1624,7 @@ class MCPTransactionProxy:
         for client in self._upstreams.values():
             try:
                 raw_res = await client.aread_resource(uri)
-                return self._record_resource_read(params, uri, raw_res)
+                return await self._run_store_op(self._record_resource_read, params, uri, raw_res)
             except NotImplementedError:
                 continue
         raise ValueError(f"No upstream server could read MCP resource '{uri}'.")
@@ -1548,8 +1760,8 @@ class MCPTransactionProxy:
 
         if method == "slim/rollback":
             session_id = str(params.get("session_id") or self.default_session_id)
-            with self.session_store.session_lock(session_id):
-                gate = self._load_gate(session_id)
+            async with self.session_store.async_session_lock(session_id):
+                gate = await self._run_store_op(self._load_gate, session_id)
                 summary = await gate.arollback(
                     stop_on_error=bool(params.get("stop_on_error", False))
                 )
@@ -1564,6 +1776,53 @@ class MCPTransactionProxy:
                         "details": summary.details,
                     },
                 )
+
+        if method == "slim/observe_user":
+            session_id = str(params.get("session_id") or self.default_session_id)
+            text = str(params.get("text") or "")
+            advance_turn = bool(params.get("advance_turn", True))
+
+            def _do_observe() -> Dict[str, Any]:
+                gate = self._load_gate(session_id)
+                if advance_turn:
+                    gate.ledger.advance_turn()
+                gate.ledger.observe_user_input(text)
+                gate.save()
+                return _jsonrpc_ok(req_id, {"session_id": session_id, "turn": gate.ledger.turn})
+
+            async with self.session_store.async_session_lock(session_id):
+                return await self._run_store_op(_do_observe)
+
+        if method == "slim/commit":
+            session_id = str(params.get("session_id") or self.default_session_id)
+
+            def _do_commit() -> Dict[str, Any]:
+                gate = self._load_gate(session_id)
+                gate.commit()
+                return _jsonrpc_ok(
+                    req_id,
+                    {"session_id": session_id, "pending_saga_steps": gate.saga.pending_count},
+                )
+
+            async with self.session_store.async_session_lock(session_id):
+                return await self._run_store_op(_do_commit)
+
+        if method == "slim/audit_verify":
+            session_id = str(params.get("session_id") or self.default_session_id)
+
+            def _do_verify() -> Dict[str, Any]:
+                gate = self._load_gate(session_id)
+                return _jsonrpc_ok(
+                    req_id,
+                    {
+                        "session_id": session_id,
+                        "chain_valid": gate.verify_audit_chain(),
+                        "receipt_count": len(gate.receipts),
+                    },
+                )
+
+            async with self.session_store.async_session_lock(session_id):
+                return await self._run_store_op(_do_verify)
 
         handled, response = self._handle_non_call_jsonrpc(req_id, method, params)
         if handled:

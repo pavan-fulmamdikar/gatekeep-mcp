@@ -522,6 +522,8 @@ class MCPHttpGateway:
         cors_origins: Optional[str] = "*",
         slack_signing_secret: Optional[str] = None,
         slack_max_clock_skew_s: float = 300.0,
+        sse_pubsub_client: Optional[Any] = None,
+        sse_pubsub_channel: str = "gatekeep:sse:broadcast",
     ) -> None:
         self.proxy = proxy
         merged_principals: Dict[str, ApiPrincipal] = {
@@ -564,6 +566,31 @@ class MCPHttpGateway:
         self._sse_lock = threading.RLock()
         self._sse_channels: Dict[str, List[Tuple[Optional[asyncio.AbstractEventLoop], Any]]] = {}
 
+        # Optional multi-replica SSE Pub/Sub fan-out (auto-detected from RedisSessionStore)
+        self._instance_id: str = uuid.uuid4().hex
+        self._sse_pubsub_channel: str = str(sse_pubsub_channel or "gatekeep:sse:broadcast")
+        if sse_pubsub_client is False:
+            resolved_pubsub = None
+        elif sse_pubsub_client is not None:
+            resolved_pubsub = sse_pubsub_client
+        else:
+            candidate = getattr(proxy.session_store, "_client", None)
+            resolved_pubsub = (
+                candidate
+                if (
+                    candidate is not None
+                    and callable(getattr(candidate, "publish", None))
+                    and callable(getattr(candidate, "pubsub", None))
+                )
+                else None
+            )
+        self._sse_pubsub_client: Optional[Any] = resolved_pubsub
+        self._sse_pubsub_stop: Optional[threading.Event] = None
+        self._sse_pubsub_thread: Optional[threading.Thread] = None
+        self._sse_pubsub_obj: Optional[Any] = None
+        if self._sse_pubsub_client is not None:
+            self._start_sse_pubsub_listener()
+
     def start_recovery_daemon(self, interval_seconds: float = 30.0) -> None:
         """Start a background thread running `recovery_daemon.sweep_once()` periodically."""
         interval = max(0.05, float(interval_seconds))
@@ -595,6 +622,87 @@ class MCPHttpGateway:
             self._recovery_thread.join(timeout=timeout_s)
         self._recovery_thread = None
         self._recovery_stop = None
+
+    def _start_sse_pubsub_listener(self) -> None:
+        """Start background Redis Pub/Sub subscriber for cross-replica SSE fan-out."""
+        if self._sse_pubsub_client is None:
+            return
+        if self._sse_pubsub_thread is not None and self._sse_pubsub_thread.is_alive():
+            return
+        try:
+            pubsub = self._sse_pubsub_client.pubsub(ignore_subscribe_messages=True)
+        except TypeError:
+            pubsub = self._sse_pubsub_client.pubsub()
+        pubsub.subscribe(self._sse_pubsub_channel)
+        self._sse_pubsub_obj = pubsub
+        stop_event = threading.Event()
+        self._sse_pubsub_stop = stop_event
+
+        def _listener() -> None:
+            while not stop_event.is_set():
+                try:
+                    msg = pubsub.get_message(ignore_subscribe_messages=True, timeout=0.1)
+                except TypeError:
+                    try:
+                        msg = pubsub.get_message(timeout=0.1)
+                    except Exception:
+                        msg = None
+                except Exception as exc:
+                    if not stop_event.is_set():
+                        logger.warning(f"[MCPHttpGateway] SSE pubsub listener error: {exc}")
+                        stop_event.wait(0.2)
+                    continue
+                if not msg or msg.get("type") not in ("message", "pmessage", None):
+                    if not msg:
+                        # Avoid tight busy-loop on fake pubsub clients whose get_message doesn't sleep
+                        stop_event.wait(0.01)
+                    continue
+                raw_data = msg.get("data")
+                if raw_data is None:
+                    continue
+                if isinstance(raw_data, bytes):
+                    raw_data = raw_data.decode("utf-8", errors="replace")
+                if not isinstance(raw_data, str):
+                    continue
+                try:
+                    envelope = json.loads(raw_data)
+                except Exception:
+                    continue
+                if not isinstance(envelope, dict):
+                    continue
+                if envelope.get("origin") == self._instance_id:
+                    continue
+                remote_keys = envelope.get("keys")
+                remote_payload = envelope.get("payload")
+                if isinstance(remote_keys, list) and isinstance(remote_payload, str):
+                    self._publish_sse_local([str(k) for k in remote_keys], remote_payload)
+
+        self._sse_pubsub_thread = threading.Thread(
+            target=_listener,
+            name=f"gatekeep-sse-pubsub-{self._instance_id[:8]}",
+            daemon=True,
+        )
+        self._sse_pubsub_thread.start()
+
+    def stop_sse_pubsub(self, timeout_s: float = 2.0) -> None:
+        """Stop the Redis Pub/Sub SSE listener thread if active."""
+        if self._sse_pubsub_stop is not None:
+            self._sse_pubsub_stop.set()
+        if self._sse_pubsub_thread is not None and self._sse_pubsub_thread.is_alive():
+            self._sse_pubsub_thread.join(timeout=timeout_s)
+        if self._sse_pubsub_obj is not None:
+            try:
+                self._sse_pubsub_obj.close()
+            except Exception:
+                pass
+        self._sse_pubsub_thread = None
+        self._sse_pubsub_stop = None
+        self._sse_pubsub_obj = None
+
+    def close(self) -> None:
+        """Stop all background daemon threads managed by this gateway."""
+        self.stop_recovery_daemon()
+        self.stop_sse_pubsub()
 
     # ── Tenant Auth & Scoping Helpers ──────────────────────────────────────────
 
@@ -755,8 +863,7 @@ class MCPHttpGateway:
                 if not self._sse_channels[key]:
                     self._sse_channels.pop(key, None)
 
-    def _publish_sse(self, keys: List[str], event_name: str, data: Any) -> None:
-        payload = f"event: {event_name}\ndata: {json.dumps(data, default=str)}\n\n"
+    def _publish_sse_local(self, keys: List[str], payload: str) -> None:
         with self._sse_lock:
             targets: List[Tuple[Optional[asyncio.AbstractEventLoop], Any]] = []
             seen: set[int] = set()
@@ -777,6 +884,23 @@ class MCPHttpGateway:
                     qq.put_nowait(payload)
                 except Exception:
                     pass
+
+    def _publish_sse(self, keys: List[str], event_name: str, data: Any) -> None:
+        payload = f"event: {event_name}\ndata: {json.dumps(data, default=str)}\n\n"
+        self._publish_sse_local(keys, payload)
+        if self._sse_pubsub_client is not None:
+            envelope = json.dumps(
+                {
+                    "origin": self._instance_id,
+                    "keys": list(keys),
+                    "payload": payload,
+                },
+                default=str,
+            )
+            try:
+                self._sse_pubsub_client.publish(self._sse_pubsub_channel, envelope)
+            except Exception as exc:
+                logger.warning(f"[MCPHttpGateway] Failed to publish SSE broadcast: {exc}")
 
     # ── Core Shared HTTP Router ────────────────────────────────────────────────
 
@@ -998,20 +1122,29 @@ class MCPHttpGateway:
             return _HttpResponse(status=204, headers={}, body=b"")
 
         if method == "GET" and path == "/healthz":
+            session_count = await self.proxy._run_store_op(
+                self.proxy.session_store.count_sessions
+            )
             return _json_response(
                 200,
                 {
                     "status": "ok",
                     "protocol": MCP_PROTOCOL_VERSION,
-                    "sessions": len(self.proxy.session_store.list_sessions()),
+                    "sessions": int(session_count),
                 },
             )
 
         if method == "GET" and path == "/metrics":
             quarantined_count = len(getattr(self.proxy, "_compromised_tools", {}) or {})
+            session_count = await self.proxy._run_store_op(
+                self.proxy.session_store.count_sessions
+            )
+            pending_escalations = len(
+                await self.proxy._run_store_op(self.proxy.escalation_router.list_pending)
+            )
             prom_text = self.metrics.render_prometheus(
-                active_sessions=len(self.proxy.session_store.list_sessions()),
-                pending_escalations=len(self.proxy.escalation_router.list_pending()),
+                active_sessions=int(session_count),
+                pending_escalations=pending_escalations,
                 quarantined_tools=quarantined_count,
             )
             return _text_response(
@@ -1559,5 +1692,5 @@ def serve_http(
     try:
         server.serve_forever()
     finally:
-        gateway.stop_recovery_daemon()
+        gateway.close()
         server.server_close()

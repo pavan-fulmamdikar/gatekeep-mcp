@@ -233,7 +233,13 @@ class LedgerEntry:
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        return {
+            "key": self.key,
+            "value": self.value,
+            "source_tool": self.source_tool,
+            "turn": self.turn,
+            "timestamp": self.timestamp,
+        }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "LedgerEntry":

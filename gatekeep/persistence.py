@@ -15,6 +15,7 @@ session locking, and crash recovery of uncommitted Saga compensations:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -24,9 +25,9 @@ import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Tuple
 
 
 class ConcurrencyConflictError(RuntimeError):
@@ -82,7 +83,7 @@ def _check_expected_version(
 
 
 def _encode_json(obj: Any) -> str:
-    return json.dumps(obj, sort_keys=True, default=str)
+    return json.dumps(obj, separators=(",", ":"), default=str)
 
 
 def _build_versioned_payload(
@@ -134,6 +135,10 @@ class SessionStateStore(ABC):
     def list_sessions(self) -> List[str]:
         """Return all stored session IDs."""
 
+    def count_sessions(self) -> int:
+        """Return total stored session count without materializing IDs when supported."""
+        return len(self.list_sessions())
+
     def exists(self, session_id: str) -> bool:
         """Return True if a persisted snapshot exists for `session_id`."""
         return self.load(session_id) is not None
@@ -142,6 +147,50 @@ class SessionStateStore(ABC):
     def session_lock(self, session_id: str, timeout_s: float = 10.0) -> Iterator[None]:
         """Acquire a re-entrant / mutually exclusive lock scoped to `session_id`."""
         yield
+
+    def _get_async_session_lock(self, session_id: str) -> asyncio.Lock:
+        """Return a per-(event-loop, session_id) asyncio.Lock without blocking the event loop."""
+        guard = getattr(self, "_async_locks_guard", None)
+        if guard is None:
+            guard = threading.Lock()
+            self._async_locks_guard = guard
+        locks = getattr(self, "_async_session_locks", None)
+        if locks is None:
+            locks = {}
+            self._async_session_locks = locks
+        loop_id = id(asyncio.get_running_loop())
+        key = (loop_id, str(session_id))
+        with guard:
+            lock = locks.get(key)
+            if lock is None:
+                if len(locks) > 2048:
+                    stale = [k for k, v in locks.items() if not v.locked()]
+                    for k in stale[: len(stale) // 2 + 1]:
+                        locks.pop(k, None)
+                lock = asyncio.Lock()
+                locks[key] = lock
+            return lock
+
+    @asynccontextmanager
+    async def async_session_lock(
+        self, session_id: str, timeout_s: float = 10.0
+    ) -> AsyncIterator[None]:
+        """
+        Event-loop-safe async session lock. Serializes same-session coroutines
+        via an `asyncio.Lock` without holding a blocking `threading.RLock` across
+        `await` boundaries (allowing concurrent sessions to make full progress).
+        """
+        lock = self._get_async_session_lock(session_id)
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=max(0.05, float(timeout_s)))
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                f"Timed out after {timeout_s}s acquiring async session lock for '{session_id}'."
+            ) from exc
+        try:
+            yield
+        finally:
+            lock.release()
 
     def save_control_doc(self, namespace: str, doc: Dict[str, Any]) -> None:
         """
@@ -318,6 +367,10 @@ class InMemorySessionStore(SessionStateStore):
     def list_sessions(self) -> List[str]:
         with self._lock:
             return sorted(self._sessions.keys())
+
+    def count_sessions(self) -> int:
+        with self._lock:
+            return len(self._sessions)
 
     @contextmanager
     def session_lock(self, session_id: str, timeout_s: float = 10.0) -> Iterator[None]:
@@ -510,6 +563,13 @@ class SQLiteSessionStore(SessionStateStore):
             cur = self._conn.cursor()
             cur.execute("SELECT session_id FROM gatekeep_sessions ORDER BY session_id ASC")
             return [str(r[0]) for r in cur.fetchall()]
+
+    def count_sessions(self) -> int:
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM gatekeep_sessions")
+            row = cur.fetchone()
+            return int(row[0]) if row is not None else 0
 
     def save_control_doc(self, namespace: str, doc: Dict[str, Any]) -> None:
         payload = _encode_json(doc)
@@ -748,6 +808,8 @@ class RedisSessionStore(SessionStateStore):
                         )
                         pipe.multi()
                         self._write_key(pipe, key, payload)
+                        if hasattr(pipe, "sadd"):
+                            pipe.sadd(f"{self._prefix}__sessions__", session_id)
                         pipe.execute()
                         return next_version
                     except Exception as exc:
@@ -766,19 +828,28 @@ class RedisSessionStore(SessionStateStore):
                 session_id, snapshot, current_version, expected_version
             )
             self._write_key(self._client, key, payload)
+            if hasattr(self._client, "sadd"):
+                self._client.sadd(f"{self._prefix}__sessions__", session_id)
             return next_version
 
     def load(self, session_id: str) -> Optional[Dict[str, Any]]:
         return self._decode(self._client.get(self._key(session_id)))
 
     def delete(self, session_id: str) -> bool:
-        return bool(self._client.delete(self._key(session_id)))
+        removed = bool(self._client.delete(self._key(session_id)))
+        if hasattr(self._client, "srem"):
+            try:
+                self._client.srem(f"{self._prefix}__sessions__", session_id)
+            except Exception:
+                pass
+        return removed
 
     def list_sessions(self) -> List[str]:
         pattern = f"{self._prefix}*"
         lock_marker = f"{self._prefix}lock:"
         cp_marker = f"{self._prefix}__cp__:"
         audit_marker = f"{self._prefix}__audit__"
+        idx_marker = f"{self._prefix}__sessions__"
         if hasattr(self._client, "scan_iter"):
             raw_keys = list(self._client.scan_iter(match=pattern))
         else:
@@ -787,11 +858,24 @@ class RedisSessionStore(SessionStateStore):
         sessions: List[str] = []
         for k in raw_keys:
             k_str = k.decode("utf-8") if isinstance(k, bytes) else str(k)
-            if k_str.startswith(lock_marker) or k_str.startswith(cp_marker) or k_str == audit_marker:
+            if (
+                k_str.startswith(lock_marker)
+                or k_str.startswith(cp_marker)
+                or k_str == audit_marker
+                or k_str == idx_marker
+            ):
                 continue
             if k_str.startswith(self._prefix):
                 sessions.append(k_str[len(self._prefix):])
         return sorted(sessions)
+
+    def count_sessions(self) -> int:
+        if hasattr(self._client, "scard"):
+            try:
+                return int(self._client.scard(f"{self._prefix}__sessions__"))
+            except Exception:
+                pass
+        return len(self.list_sessions())
 
     def save_control_doc(self, namespace: str, doc: Dict[str, Any]) -> None:
         cp_key = f"{self._prefix}__cp__:{namespace}"
@@ -891,6 +975,58 @@ class RedisSessionStore(SessionStateStore):
             except Exception:
                 pass
 
+    @asynccontextmanager
+    async def async_session_lock(
+        self, session_id: str, timeout_s: float = 10.0
+    ) -> AsyncIterator[None]:
+        """Non-blocking distributed Redis session lock safe for asyncio event loops."""
+        local_lock = self._get_async_session_lock(session_id)
+        deadline = time.monotonic() + float(timeout_s)
+        try:
+            await asyncio.wait_for(
+                local_lock.acquire(), timeout=max(0.05, deadline - time.monotonic())
+            )
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                f"Timed out after {timeout_s}s acquiring local Redis async lock for '{session_id}'."
+            ) from exc
+
+        lock_key = self._lock_key(session_id)
+        token = uuid.uuid4().hex
+        px_ms = max(1000, int(float(timeout_s) * 1000))
+        acquired = False
+        try:
+            while time.monotonic() < deadline:
+                acquired = bool(
+                    await asyncio.to_thread(
+                        self._client.set, lock_key, token, nx=True, px=px_ms
+                    )
+                )
+                if acquired:
+                    break
+                await asyncio.sleep(0.015)
+
+            if not acquired:
+                raise TimeoutError(
+                    f"Timed out after {timeout_s}s acquiring Redis session lock for '{session_id}'."
+                )
+            try:
+                yield
+            finally:
+                def _release() -> None:
+                    try:
+                        cur_token = self._client.get(lock_key)
+                        if isinstance(cur_token, bytes):
+                            cur_token = cur_token.decode("utf-8")
+                        if cur_token == token:
+                            self._client.delete(lock_key)
+                    except Exception:
+                        pass
+
+                await asyncio.to_thread(_release)
+        finally:
+            local_lock.release()
+
 
 class PostgresSessionStore(SessionStateStore):
     """
@@ -909,6 +1045,8 @@ class PostgresSessionStore(SessionStateStore):
         conn: Optional[Any] = None,
         table_name: str = "gatekeep_sessions",
         pool: Optional[Any] = None,
+        pool_min_size: int = 2,
+        pool_max_size: int = 16,
     ):
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table_name):
             raise ValueError(f"Invalid SQL identifier for table_name: '{table_name}'.")
@@ -919,14 +1057,38 @@ class PostgresSessionStore(SessionStateStore):
         self._cp_table = f"{table_name}_control_plane"
         self._audit_table = f"{table_name}_audit_log"
         self._pool = pool
-        self._owns_conn = conn is None and pool is None
-        self._conn = (
-            conn
-            if conn is not None
-            else (None if pool is not None else self._connect(str(dsn)))
-        )
+        self._conn = conn
+        self._owns_conn = False
+        if conn is None and pool is None:
+            created_pool, created_conn = self._connect_or_pool(
+                str(dsn), min_size=int(pool_min_size), max_size=int(pool_max_size)
+            )
+            self._pool = created_pool
+            self._conn = created_conn
+            self._owns_conn = created_conn is not None
         self._local_lock = threading.RLock()
         self._init_schema()
+
+    @classmethod
+    def _connect_or_pool(
+        cls, dsn: str, *, min_size: int = 2, max_size: int = 16
+    ) -> Tuple[Optional[Any], Optional[Any]]:
+        """Prefer `psycopg_pool.ConnectionPool` for multi-request concurrency, falling back to single conn."""
+        try:
+            from psycopg_pool import ConnectionPool  # type: ignore
+
+            return (
+                ConnectionPool(
+                    dsn,
+                    min_size=max(1, min_size),
+                    max_size=max(min_size, max_size),
+                    open=True,
+                ),
+                None,
+            )
+        except ImportError:
+            pass
+        return None, cls._connect(dsn)
 
     @staticmethod
     def _connect(dsn: str) -> Any:
@@ -1121,6 +1283,16 @@ class PostgresSessionStore(SessionStateStore):
             finally:
                 cur.close()
 
+    def count_sessions(self) -> int:
+        with self._connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(f"SELECT COUNT(*) FROM {self._table}")
+                row = cur.fetchone()
+                return int(row[0]) if row is not None else 0
+            finally:
+                cur.close()
+
     def save_control_doc(self, namespace: str, doc: Dict[str, Any]) -> None:
         payload = _encode_json(doc)
         now = time.time()
@@ -1310,6 +1482,102 @@ class PostgresSessionStore(SessionStateStore):
                         pass
                 finally:
                     cur.close()
+
+    @asynccontextmanager
+    async def async_session_lock(
+        self, session_id: str, timeout_s: float = 10.0
+    ) -> AsyncIterator[None]:
+        """
+        Non-blocking async Postgres session lock.
+        Serializes same-pod coroutines via `asyncio.Lock`, and when a connection pool
+        supporting `getconn`/`putconn` is configured (e.g. `psycopg_pool.ConnectionPool`),
+        acquires a cross-pod `pg_try_advisory_lock` off the event loop thread.
+        """
+        local_lock = self._get_async_session_lock(session_id)
+        deadline = time.monotonic() + float(timeout_s)
+        try:
+            await asyncio.wait_for(
+                local_lock.acquire(), timeout=max(0.05, deadline - time.monotonic())
+            )
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                f"Timed out after {timeout_s}s acquiring local Postgres async lock for '{session_id}'."
+            ) from exc
+
+        try:
+            if (
+                self._pool is None
+                or not hasattr(self._pool, "getconn")
+                or not hasattr(self._pool, "putconn")
+            ):
+                # Single-connection mode: avoid holding `_local_lock` across `await`;
+                # row-level `SELECT ... FOR UPDATE` CAS protects cross-replica writes.
+                yield
+                return
+
+            key = self._advisory_key(session_id)
+
+            def _try_acquire() -> Optional[Any]:
+                conn = self._pool.getconn()
+                try:
+                    cur = conn.cursor()
+                    try:
+                        cur.execute("SELECT pg_try_advisory_lock(%s)", (key,))
+                        row = cur.fetchone()
+                        ok = bool(row and row[0])
+                        if not getattr(conn, "autocommit", False):
+                            conn.commit()
+                    finally:
+                        cur.close()
+                    if ok:
+                        return conn
+                except Exception:
+                    try:
+                        self._pool.putconn(conn)
+                    except Exception:
+                        pass
+                    raise
+                self._pool.putconn(conn)
+                return None
+
+            def _unlock_and_return(conn: Any) -> None:
+                try:
+                    cur = conn.cursor()
+                    try:
+                        cur.execute("SELECT pg_advisory_unlock(%s)", (key,))
+                        if not getattr(conn, "autocommit", False):
+                            conn.commit()
+                    except Exception:
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                    finally:
+                        cur.close()
+                finally:
+                    try:
+                        self._pool.putconn(conn)
+                    except Exception:
+                        pass
+
+            lock_conn: Optional[Any] = None
+            while time.monotonic() < deadline:
+                lock_conn = await asyncio.to_thread(_try_acquire)
+                if lock_conn is not None:
+                    break
+                await asyncio.sleep(0.015)
+
+            if lock_conn is None:
+                raise TimeoutError(
+                    f"Timed out after {timeout_s}s acquiring Postgres advisory lock for '{session_id}'."
+                )
+
+            try:
+                yield
+            finally:
+                await asyncio.to_thread(_unlock_and_return, lock_conn)
+        finally:
+            local_lock.release()
 
     def close(self) -> None:
         if self._pool is not None and hasattr(self._pool, "close"):

@@ -288,6 +288,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run networked Streamable-HTTP/SSE MCP Gateway + Control Plane on HOST:PORT (e.g. 0.0.0.0:8080).",
     )
     parser.add_argument(
+        "--asgi",
+        action="store_true",
+        help="Serve --http using uvicorn ASGI instead of stdlib ThreadingHTTPServer (recommended for high QPS).",
+    )
+    parser.add_argument(
         "--api-key",
         action="append",
         default=[],
@@ -532,6 +537,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             principals = _build_principals_from_args(args)
             slack_secret = args.slack_signing_secret or os.environ.get("SLIM_SLACK_SIGNING_SECRET")
             jwt_secret = args.jwt_secret or os.environ.get("SLIM_JWT_SECRET")
+            sse_pubsub_client = None
+            if getattr(args, "pg_dsn", None) and getattr(args, "redis_url", None):
+                try:
+                    import redis  # type: ignore
+
+                    sse_pubsub_client = redis.Redis.from_url(
+                        args.redis_url, decode_responses=True
+                    )
+                except ImportError as exc:
+                    raise ImportError(
+                        "Passing --redis-url with --pg-dsn for multi-replica SSE Pub/Sub requires 'redis'. "
+                        "Install with: pip install gatekeep-mcp[redis]"
+                    ) from exc
             gateway = MCPHttpGateway(
                 proxy,
                 principals=principals or None,
@@ -540,13 +558,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 jwt_issuer=getattr(args, "jwt_issuer", None),
                 jwt_audience=getattr(args, "jwt_audience", None),
                 slack_signing_secret=slack_secret,
+                sse_pubsub_client=sse_pubsub_client,
             )
-            serve_http(
-                gateway,
-                host=host,
-                port=port,
-                recovery_interval_s=args.recovery_interval,
-            )
+            if getattr(args, "asgi", False):
+                try:
+                    import uvicorn  # type: ignore
+                except ImportError as exc:
+                    raise ImportError(
+                        "--asgi requires 'uvicorn'. Install with: pip install gatekeep-mcp[http]"
+                    ) from exc
+                if args.recovery_interval is not None and args.recovery_interval > 0:
+                    gateway.start_recovery_daemon(args.recovery_interval)
+                try:
+                    uvicorn.run(gateway, host=host, port=port, log_level="info")
+                finally:
+                    gateway.close()
+            else:
+                serve_http(
+                    gateway,
+                    host=host,
+                    port=port,
+                    recovery_interval_s=args.recovery_interval,
+                )
         else:
             proxy.serve_stdio()
         return 0

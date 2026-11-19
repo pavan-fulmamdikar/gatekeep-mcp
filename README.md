@@ -48,9 +48,9 @@ flowchart LR
 pip install gatekeep-mcp
 
 # Optional production extras:
-pip install "gatekeep-mcp[gateway]"   # uvicorn + httpx for ASGI HTTP/SSE
-pip install "gatekeep-mcp[postgres]"  # psycopg[binary] for multi-worker Postgres
-pip install "gatekeep-mcp[redis]"     # redis for distributed session/quota locks
+pip install "gatekeep-mcp[gateway]"   # uvicorn + httpx for ASGI HTTP/SSE & pooled async upstream
+pip install "gatekeep-mcp[postgres]"  # psycopg[binary] + psycopg-pool for multi-worker Postgres
+pip install "gatekeep-mcp[redis]"     # redis for distributed session locks & cross-pod SSE Pub/Sub
 ```
 
 ### 2. Wrap Any Claude Desktop / Cursor MCP Server (Safe `--shadow` Dry-Run First)
@@ -95,13 +95,14 @@ gatekeep \
   --approver-key myservice=secret_approver_key \
   --strict-rbac
 
-# Or boot Gateway + Postgres + Redis via Docker Compose:
-SLIM_UPSTREAM="https://mcp.internal.example/mcp" SLIM_API_KEY="acme=change_me" docker compose up -d
+# Or boot Multi-Replica HA stack (2 ASGI Gatekeep pods + PostgreSQL 16 + Redis 7 Pub/Sub SSE):
+docker compose -f docker-compose.ha.yml up -d
 ```
 
 Built-in HTTP endpoints:
-- `POST /mcp` (Streamable-HTTP) and `GET /sse` + `POST /messages`
-- `GET /dashboard` (live approvals & audit web console) & `GET /metrics` (Prometheus gauges including `slim_gateway_quarantined_tools`)
+- `POST /mcp` (Streamable-HTTP) and `GET /sse` + `POST /messages` (with automatic Redis Pub/Sub cross-replica SSE fan-out when backed by Redis or `--redis-url`)
+- `GET /healthz` and `GET /metrics` (O(1) session counts via `SELECT COUNT(*)` / Redis `SCARD`, Prometheus gauges including `slim_gateway_quarantined_tools`)
+- `GET /dashboard` (live approvals & audit web console)
 - `GET|POST /admin/policies`, `POST /admin/policies/simulate`, `GET /admin/tools/quarantined`, `POST /admin/tools/trust`
 - `GET /admin/escalations`, `POST /admin/escalations/{id}/approve`, `GET /admin/audit`, `GET /admin/audit/verify`, `POST /admin/recovery/sweep`
 
@@ -137,23 +138,34 @@ python examples/multi_agent_gatekeep_runner.py
 
 # 4. Multi-tenant HTTP Gateway + HITL approval flow
 python examples/http_gateway_hitl_demo.py
+
+# 5. Live Field Test against unmodified third-party MCP server (@modelcontextprotocol/server-filesystem via npx)
+python examples/field_test_third_party_mcp.py
 ```
 
 ---
 
 ## Benchmarks & Honest Limitations
 
-### Local Verification (`pytest tests/` + `benchmarks/bench_adversarial_security.py`)
-- **Unit & Integration Suite:** `122 passed` in **~4s** (pure Python stdlib + SQLite; zero model downloads or heavy ML deps).
+### Local Verification (`pytest tests/`, Live `uvicorn` Load, & Real Third-Party MCP Field Test)
+- **Unit & Runtime Scaling Suite:** `127 passed` (`tests/test_runtime_scaling.py` verifies O(1) `count_sessions()`, auto `psycopg_pool.ConnectionPool`, non-blocking async cross-session concurrency, pooled `httpx.AsyncClient`, and cross-replica Redis Pub/Sub SSE fan-out with origin self-echo suppression; `tests/test_ha_postgres_redis_integration.py` runs 4 live PostgreSQL 16 + Redis 7 multi-replica soak tests when `GATEKEEP_LIVE_PG_DSN` / `GATEKEEP_LIVE_REDIS_URL` are set).
 - **70-Scenario Security & False-Positive Suite ([bench_adversarial_security.py](benchmarks/bench_adversarial_security.py)):** `35/35 (100.0%)` synthetic attacks mitigated, `35/35` legitimate workflows allowed (`0.0%` false-block rate), **`~2–5ms` p50** proxy+SQLite latency.
+- **Live `uvicorn` ASGI HTTP Load Benchmark ([bench_http_load.py](benchmarks/bench_http_load.py), single worker sharing loopback host with `httpx` client):**
+  - `InMemorySessionStore` (`c=10`, 400 mixed reqs): **`121.5 req/s`**, `p50=70.7ms`, `p95=145.4ms`, `0` HTTP errors, `100/100` attacks blocked, RSS `54.8 -> 59.0 MiB`.
+  - `SQLiteSessionStore` WAL (`c=10`, 400 mixed reqs): **`96.5 req/s`**, `p50=104.7ms`, `p95=141.3ms`, `/healthz` `p50=39.6ms`, `0` HTTP errors, `100/100` attacks blocked, RSS `56.4 -> 64.9 MiB`.
+  - Burst (`c=25–30`, 500–600 reqs): **`104.9 req/s`** (memory) / **`70.6 req/s`** (SQLite WAL), `0` HTTP errors, `100%` attack block rate. Scale horizontally with `--asgi` multi-worker / Kubernetes pods backed by PostgreSQL 16 + Redis 7.
+- **Live Third-Party MCP Server Field Test ([field_test_third_party_mcp.py](examples/field_test_third_party_mcp.py)):**
+  - Wrapped unmodified Anthropic `@modelcontextprotocol/server-filesystem` over real `npx` stdio (`16` real tools auto-classified by `generate_starter_policy()`).
+  - Enforcing mode: `3/3` benign operations allowed (`list_directory`, `read_text_file`, `write_file`), `4/4` live attacks blocked before reaching Node.js (`../../etc/passwd`, `.env.production`, `.ssh/id_rsa`, outbound AWS key DLP in `write_file`), **`0.463ms` median Gatekeep evaluation latency** (`0.694ms` max), valid SHA-256 audit chain (`7` receipts).
+  - Shadow mode also accurately demonstrated real-world prompt-intent behavior: vague user prompts (`"Work with files in ..."`) surfaced `unsolicited_tainted_write` shadow flags on `write_file`/`edit_file` without blocking execution (`14.1ms` median e2e).
 - **Zero-Help Live Multi-Agent Stress Findings (`groq / openai/gpt-oss-120b`):**
-  Running an uncoached autonomous coordinator with unfiltered tools across hostile workspace SOP traps added **`0.30–0.35ms` p50** Gatekeep overhead, blocked `.env.secrets`, IMDS `169.254.169.254`, `VENDOR-EVIL-99`, and leaked `Bearer` exfiltration, and cleanly reverted SQLite rows on `503` failures. It also surfaced two real multi-agent bugs (shared read circuit breakers bricking safe paths, and `saga_transaction_aborted` blocking post-mortem comms actors) which are now fixed and regression-tested in [tests/test_multi_agent_gatekeep.py](tests/test_multi_agent_gatekeep.py).
+  Running an uncoached autonomous coordinator with unfiltered tools across hostile workspace SOP traps added **`0.30–0.35ms` p50** Gatekeep overhead, blocked `.env.secrets`, IMDS `169.254.169.254`, `VENDOR-EVIL-99`, and leaked `Bearer` exfiltration, and cleanly reverted SQLite rows on `503` failures.
 
 ### Known Limitations (Read Before Deploying to High-Scale Prod)
-1. **Heuristics vs. Vague Prompts:** Under zero-config intent checks, read-phrased prompts without explicit mutating verbs (e.g., *"Complete the audit workflow and report back"*) can trigger `unsolicited_tainted_write` if an agent attempts writes after reading untrusted files—configure explicit `ToolPolicySpec` rules or test in `--shadow` first.
+1. **Heuristics vs. Vague Prompts:** When `_meta.user_prompt` is supplied and contains only read-phrased language without mutating verbs, zero-config intent checks can flag writes after untrusted reads as `unsolicited_tainted_write`—configure explicit `ToolPolicySpec` rules or validate in `--shadow` first.
 2. **Non-Reversible External Side Effects:** Saga compensation (`compensates_with`) cleanly undoes reversible actions (DB rows, cloud allocations, payment authorizations), but cannot un-send emails or undo irreversible third-party webhooks—gate those with `requires_approval=True`.
 3. **DNS SSRF Check Is Opt-In (`resolve_dns_for_ssrf=False`):** By default, SSRF protection inspects URL schemes, IP literals, obfuscated IPs, and metadata hostnames with zero network latency; enable `resolve_dns_for_ssrf=True` (and pair with network egress controls) where DNS-rebinding attacks are in scope.
-4. **High-Throughput Scaling Notes:** `POST /mcp` workers scale horizontally via Postgres/Redis, while legacy `GET /sse` queues live in process memory (use sticky sessions for SSE), and Postgres/Redis CI tests use in-memory driver mocks unless pointed at live instances.
+4. **Live Postgres 16 / Redis 7 HA Verification Requires Docker:** `tests/test_ha_postgres_redis_integration.py` skips cleanly when `GATEKEEP_LIVE_PG_DSN` / `GATEKEEP_LIVE_REDIS_URL` are unset; run against real containers via `docker compose -f docker-compose.ha.yml up -d` in CI/staging before high-QPS multi-replica rollout.
 
 ---
 
@@ -163,6 +175,13 @@ python examples/http_gateway_hitl_demo.py
 pip install -e ".[dev]"
 pytest tests/ -v
 python benchmarks/bench_adversarial_security.py
+python benchmarks/bench_http_load.py --store sqlite --requests 500 --concurrency 25
+
+# Live Multi-Replica PostgreSQL 16 + Redis 7 HA Soak Tests (requires Docker):
+docker compose -f docker-compose.ha.yml up -d postgres redis
+GATEKEEP_LIVE_PG_DSN=postgresql://gatekeep:gatekeep_dev@localhost:5432/gatekeep \
+GATEKEEP_LIVE_REDIS_URL=redis://localhost:6379/0 \
+pytest tests/test_ha_postgres_redis_integration.py -v
 ```
 
 ## License
