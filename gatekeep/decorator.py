@@ -48,7 +48,7 @@ def slim_tool(
     registry: Optional[ToolRegistry] = None,
 ) -> Any:
     """
-    Decorator that registers a function as a Slim-Schema / Gatekeep tool.
+    Decorator that registers a function as a Gatekeep tool.
 
     Can be used with or without arguments::
 

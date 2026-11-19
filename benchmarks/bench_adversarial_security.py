@@ -2,7 +2,7 @@
 benchmarks/bench_adversarial_security.py
 
 Comprehensive Adversarial Security, Saga Integrity & False-Positive Evaluation Suite.
-Measures Slim-Schema (PreExecutionGate + ToolReturnLedger + SagaCoordinator +
+Measures Gatekeep (PreExecutionGate + ToolReturnLedger + SagaCoordinator +
 AuditVault + MCPHttpGateway) vs an Unprotected Executor Baseline across:
   - 30 Adversarial Scenarios (IPI Exfiltration, Prerequisite Bypass, Policy/Token Bypass,
     Crash/Mid-Flight Failure Orphans on SQLite disk DB, Tenant/Audit Tampering)

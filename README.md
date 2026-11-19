@@ -6,6 +6,10 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/pavan-fulmamdikar/gatekeep-mcp/actions/workflows/ci.yml"><img src="https://github.com/pavan-fulmamdikar/gatekeep-mcp/actions/workflows/ci.yml/badge.svg" alt="Gatekeep CI" /></a>
+</p>
+
+<p align="center">
   <code>Pure Python Stdlib (0 deps)</code> &nbsp;·&nbsp;
   <code>&lt;1ms Deterministic Gate</code> &nbsp;·&nbsp;
   <code>MCP Stdio / HTTP / SSE</code> &nbsp;·&nbsp;

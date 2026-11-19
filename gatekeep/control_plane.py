@@ -763,7 +763,7 @@ class WebhookEscalationNotifier:
         body = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
         headers: Dict[str, str] = {
             "Content-Type": "application/json",
-            "User-Agent": "slim-schema-gatekeep/0.2",
+            "User-Agent": "gatekeep-mcp/0.2",
             "X-Slim-Timestamp": str(int(time.time())),
         }
         if self.signing_secret:

@@ -1,7 +1,7 @@
 """
 examples/http_gateway_hitl_demo.py
 
-End-to-end demo of Slim-Schema's multi-tenant HTTP / Control Plane Gateway:
+End-to-end demo of Gatekeep's multi-tenant HTTP / Control Plane Gateway:
   1. Multi-tenant Bearer API-key authentication & strict session scoping
   2. Live policy hot-reload via `POST /admin/policies`
   3. HITL escalation pause (`Verdict.ESCALATE`) -> approval via `/admin/escalations/{id}/approve`

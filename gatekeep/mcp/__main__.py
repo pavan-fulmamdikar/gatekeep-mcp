@@ -1,5 +1,5 @@
 """
-python -m gatekeep.mcp entry point for Slim-Schema MCP Transaction & Security Proxy.
+python -m gatekeep.mcp entry point for Gatekeep MCP Transaction & Security Proxy.
 """
 
 from gatekeep.mcp.cli import main

@@ -407,7 +407,7 @@ def test_mcp_proxy_stdio_loop_and_federated_upstreams() -> None:
     # notification produces no response -> 3 responses
     assert len(responses) == 3
     assert responses[0]["id"] == 1
-    assert responses[0]["result"]["serverInfo"]["name"] == "slim-schema-mcp-proxy"
+    assert responses[0]["result"]["serverInfo"]["name"] == "gatekeep-mcp-proxy"
     tool_names = {t["name"] for t in responses[1]["result"]["tools"]}
     assert tool_names == {"auth.get_user", "sql.ping_db"}
     assert responses[2]["result"]["structuredContent"] == {"user_id": "u-42", "tier": "pro"}

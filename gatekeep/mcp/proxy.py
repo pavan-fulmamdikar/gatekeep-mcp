@@ -254,7 +254,7 @@ class StdioMCPUpstream(MCPUpstream):
                     {
                         "protocolVersion": MCP_PROTOCOL_VERSION,
                         "capabilities": {},
-                        "clientInfo": {"name": "slim-schema-mcp-proxy", "version": "0.2.0"},
+                        "clientInfo": {"name": "gatekeep-mcp-proxy", "version": "0.2.0"},
                     },
                 )
                 notif = json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n"
@@ -538,7 +538,7 @@ class HttpMCPUpstream(MCPUpstream):
                         {
                             "protocolVersion": MCP_PROTOCOL_VERSION,
                             "capabilities": {},
-                            "clientInfo": {"name": "slim-schema-mcp-proxy", "version": "0.2.0"},
+                            "clientInfo": {"name": "gatekeep-mcp-proxy", "version": "0.2.0"},
                         },
                     )
                     target = self._sse_post_url or self.url
@@ -647,7 +647,7 @@ class HttpMCPUpstream(MCPUpstream):
                                     "protocolVersion": MCP_PROTOCOL_VERSION,
                                     "capabilities": {},
                                     "clientInfo": {
-                                        "name": "slim-schema-mcp-proxy",
+                                        "name": "gatekeep-mcp-proxy",
                                         "version": "0.2.0",
                                     },
                                 },
@@ -1642,7 +1642,7 @@ class MCPTransactionProxy:
                 {
                     "protocolVersion": MCP_PROTOCOL_VERSION,
                     "capabilities": {"tools": {"listChanged": True}, "resources": {}},
-                    "serverInfo": {"name": "slim-schema-mcp-proxy", "version": "0.2.0"},
+                    "serverInfo": {"name": "gatekeep-mcp-proxy", "version": "0.2.0"},
                 },
             )
 

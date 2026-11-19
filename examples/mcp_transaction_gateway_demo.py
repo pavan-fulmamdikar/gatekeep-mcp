@@ -1,7 +1,7 @@
 """
 examples/mcp_transaction_gateway_demo.py
 
-Self-contained 0-dependency demo of Slim-Schema's transactional safety & IPI firewall:
+Self-contained 0-dependency demo of Gatekeep's transactional safety & IPI firewall:
   1. Indirect Prompt Injection blocked at the tool boundary (untrusted email body)
   2. Multi-step write workflow with automatic LIFO Saga compensation on payment failure
   3. Tamper-evident SHA-256 AuditVault verification

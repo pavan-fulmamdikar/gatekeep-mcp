@@ -218,7 +218,7 @@ class ToolRegistry:
         on_rollback: Optional[Callable] = None,
     ) -> ToolDefinition:
         """
-        Register a callable as a Slim-Schema tool.
+        Register a callable as a Gatekeep tool.
 
         Args:
             fn:           The function to register.
