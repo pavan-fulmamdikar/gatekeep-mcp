@@ -1,0 +1,79 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gatekeep-mcp"
+version = "0.2.0"
+description = "Zero-dependency sub-millisecond firewall and automatic Saga undo proxy for MCP AI agents"
+readme = "README.md"
+license = {text = "MIT OR Apache-2.0"}
+requires-python = ">=3.9"
+authors = [
+    {name = "Gatekeep Contributors"}
+]
+keywords = [
+    "mcp",
+    "ai-agents",
+    "security-proxy",
+    "firewall",
+    "dlp",
+    "ssrf",
+    "saga",
+    "rollback",
+    "hitl",
+    "provenance",
+    "gatekeep",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+# Core proxy, provenance ledger, DLP/SSRF/SQL guards, Saga engine, SQLite store,
+# HTTP/SSE stdlib gateway, and SHA-256 AuditVault require ZERO third-party packages.
+dependencies = []
+
+[project.optional-dependencies]
+gateway = [
+    "uvicorn>=0.27.0",
+    "httpx>=0.26.0",
+]
+postgres = [
+    "psycopg[binary]>=3.1.0",
+]
+redis = [
+    "redis>=5.0.0",
+]
+all = [
+    "uvicorn>=0.27.0",
+    "httpx>=0.26.0",
+    "psycopg[binary]>=3.1.0",
+    "redis>=5.0.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "httpx>=0.26.0",
+    "uvicorn>=0.27.0",
+]
+
+[project.scripts]
+gatekeep = "gatekeep.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gatekeep*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+

@@ -1,0 +1,46 @@
+# Python environments & packaging
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+.venv/
+venv/
+venv_*/
+
+# Testing & coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+junit.xml
+
+# Secrets & local runtime state
+.env
+*.env
+!.env.example
+logs/
+*.log
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.jsonl
+
+# Editor & OS clutter
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.crdownload
+
+# Local repo scratch notes & benchmark runs
+project_list.txt
+project_tree.txt
+benchmarks/results/
+
